@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routes import transcription, translation
+from app.routes import transcription, translation, dubbing
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +44,11 @@ app.include_router(
     translation.router,
     prefix=f"{settings.API_PREFIX}/translation",
     tags=["translation"],
+)
+app.include_router(
+    dubbing.router,
+    prefix=f"{settings.API_PREFIX}/dubbing",
+    tags=["dubbing"],
 )
 
 @app.get(f"{settings.API_PREFIX}/health")

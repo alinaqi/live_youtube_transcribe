@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: str
     OPENAI_API_KEY: Optional[str] = None
     
+    # Media storage
+    MEDIA_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "media")
+    
     model_config = SettingsConfigDict(
         env_file=".env", 
         env_file_encoding="utf-8", 

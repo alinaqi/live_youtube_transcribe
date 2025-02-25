@@ -1,353 +1,228 @@
-from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
-import httpx
-import threading
-import json
 import os
-import asyncio
-import queue
-import websockets
-from websockets.sync.client import connect
-import pyaudio
+import threading
+import httpx
 import yt_dlp
-import sys
+from queue import Queue, Empty
 from pathlib import Path
-from dotenv import load_dotenv
+from time import sleep
+import time
 
-# Load environment variables from .env file
-env_path = Path(__file__).resolve().parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
+from pydub import AudioSegment
+from pydub.playback import play
 
-# Configuration - get API key from .env file
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-if not DEEPGRAM_API_KEY:
-    print("Error: DEEPGRAM_API_KEY not found in .env file")
-    sys.exit(1)
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 
-# Audio settings for playback
-TIMEOUT = 0.050
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 48000
-CHUNK = 8000
+# Set your API keys
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY") 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Ensure this is set in your environment
 
-# Voice mapping for Deepgram TTS
-VOICE_MAP = {
-    "en": "aura-orion-en",  # English
-    "es": "aura-stella-es",  # Spanish
-    "de": "aura-wilhelm-de",  # German
-    "fr": "aura-josephine-fr",  # French
-    "hi": "aura-pratik-hi",  # Hindi
-    "it": "aura-giorgia-it",  # Italian
-    "ja": "aura-yuki-ja",  # Japanese
-    "ko": "aura-jin-ko",  # Korean
-    "pt": "aura-mateus-pt",  # Portuguese
-    "zh": "aura-zhiyu-zh",  # Chinese
-}
+# Configure OpenAI client using the provided example code
+from openai import OpenAI
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Default to English if language not supported
-def get_voice_for_language(language_code):
-    return VOICE_MAP.get(language_code, "aura-orion-en")
-
-# TTS API endpoint - will be set dynamically per language
-# TTS_URL = f"wss://api.deepgram.com/v1/speak?encoding=linear16&sample_rate={RATE}&voice=aura-orion-en"
-
+# Function to extract a direct audio URL from a YouTube link
 def get_youtube_audio_url(youtube_url: str) -> str:
-    """Extract audio URL from a YouTube video link"""
     ydl_opts = {'format': 'bestaudio/best', 'quiet': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
-        # Get the best audio URL
         return info['url']
 
-class Speaker:
-    """Class to handle audio playback"""
-    _audio: pyaudio.PyAudio
-    _chunk: int
-    _rate: int
-    _format: int
-    _channels: int
-    _output_device_index: int
+# Example YouTube link; update as desired.
+youtube_link = "https://www.youtube.com/watch?v=Z39OR2zj_x8"
+URL = get_youtube_audio_url(youtube_link)
 
-    _stream: pyaudio.Stream
-    _thread: threading.Thread
-    _queue: queue.Queue
-    _exit: threading.Event
+# Create a thread-safe queues for different stages of processing
+transcript_buffer = Queue()  # For collecting transcript segments
+translation_queue = Queue()  # For translated segments to be synthesized
+audio_queue = Queue()        # For audio segments ready to be played
 
-    def __init__(
-        self,
-        rate: int = RATE,
-        chunk: int = CHUNK,
-        channels: int = CHANNELS,
-        output_device_index: int = None,
-    ):
-        self._exit = threading.Event()
-        self._queue = queue.Queue()
+# Buffer control variables
+BUFFER_TIME = 3.0  # seconds to buffer transcript segments
+buffer_lock = threading.Lock()
+buffer_content = ""
+last_segment_time = 0
 
-        self._audio = pyaudio.PyAudio()
-        self._chunk = chunk
-        self._rate = rate
-        self._format = FORMAT
-        self._channels = channels
-        self._output_device_index = output_device_index
-
-    def start(self) -> bool:
-        """Start the audio playback stream"""
-        self._stream = self._audio.open(
-            format=self._format,
-            channels=self._channels,
-            rate=self._rate,
-            input=False,
-            output=True,
-            frames_per_buffer=self._chunk,
-            output_device_index=self._output_device_index,
-        )
-
-        self._exit.clear()
-
-        self._thread = threading.Thread(
-            target=_play, args=(self._queue, self._stream, self._exit), daemon=True
-        )
-        self._thread.start()
-
-        self._stream.start_stream()
-        return True
-
-    def stop(self):
-        """Stop the audio playback stream"""
-        self._exit.set()
-
-        if self._stream is not None:
-            self._stream.stop_stream()
-            self._stream.close()
-            self._stream = None
-
-        self._thread.join()
-        self._thread = None
-        self._queue = None
-
-    def play(self, data):
-        """Add audio data to playback queue"""
-        print(f"Received audio data of length: {len(data)} bytes")  # Debug log
-        self._queue.put(data)
-
-def _play(audio_out: queue.Queue, stream, stop):
-    """Audio playback worker function"""
-    while not stop.is_set():
-        try:
-            data = audio_out.get(True, TIMEOUT)
-            print(f"Playing audio chunk of length: {len(data)} bytes")  # Debug log
-            stream.write(data)
-        except queue.Empty:
-            # Silent timeout, keep looping
-            pass
-        except Exception as e:
-            print(f"_play error: {e}")
-
-class TranscribeSpeakPipeline:
-    """Main class to handle transcription and text-to-speech pipeline"""
-    def __init__(self, youtube_url, target_language="en"):
-        self.youtube_url = youtube_url
-        self.target_language = target_language
-        self.audio_url = None
-        self.dg_connection = None
-        self.tts_socket = None
-        self.speaker = None
-        self.transcription_queue = queue.Queue()
-        self.exit = threading.Event()
-        self.lock_exit = threading.Lock()
-        
-        # Set appropriate voice for language
-        self.voice = get_voice_for_language(target_language)
-        self.tts_url = f"wss://api.deepgram.com/v1/speak?encoding=linear16&sample_rate={RATE}&voice={self.voice}"
+def buffer_processor():
+    """
+    Worker that processes the transcript buffer and sends complete thoughts for translation
+    """
+    global buffer_content, last_segment_time
     
-    def setup(self):
-        """Set up connections and resources"""
-        # Extract audio URL from YouTube
-        print(f"Extracting audio from YouTube: {self.youtube_url}")
-        self.audio_url = get_youtube_audio_url(self.youtube_url)
-        
-        # Initialize Deepgram client for transcription
-        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-        self.dg_connection = deepgram.listen.live.v('1')
-        
-        # Initialize TTS connection
-        print(f"Connecting to Deepgram TTS service with voice: {self.voice}")
-        self.tts_socket = connect(
-            self.tts_url, additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-        )
-        
-        # Initialize speaker for audio playback
-        self.speaker = Speaker()
-        self.speaker.start()
-        
-        # Set up transcription callback with proper closure
-        pipeline = self  # Capture self in closure
-        def on_transcription(dg_self, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
-            if len(sentence) == 0:
-                return
+    while True:
+        try:
+            # Get new transcript segment
+            transcript, timestamp = transcript_buffer.get(timeout=0.5)
+            
+            # Add to buffer
+            with buffer_lock:
+                if buffer_content:
+                    buffer_content += " " + transcript
+                else:
+                    buffer_content = transcript
+                last_segment_time = timestamp
+            
+            # Check if we should process the buffer (if enough time has passed or buffer is getting large)
+            current_time = time.time()
+            with buffer_lock:
+                buffer_age = current_time - last_segment_time
+                should_process = buffer_age >= BUFFER_TIME or len(buffer_content) > 150
                 
-            print(f"Transcription: {sentence}")
-            # Add transcription to queue for TTS
-            pipeline.transcription_queue.put(sentence)
+                if should_process and buffer_content.strip():
+                    content_to_process = buffer_content
+                    buffer_content = ""
+                    translation_queue.put(content_to_process)
             
-        self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcription)
-    
-    async def tts_receiver(self):
-        """Handle incoming TTS audio data"""
-        try:
-            while not self.exit.is_set():
-                if self.tts_socket is None:
-                    break
+            transcript_buffer.task_done()
+            
+        except Empty:
+            # If no new segments, check if buffer needs processing due to time
+            current_time = time.time()
+            with buffer_lock:
+                buffer_age = current_time - last_segment_time
+                if buffer_age >= BUFFER_TIME and buffer_content.strip():
+                    content_to_process = buffer_content
+                    buffer_content = ""
+                    translation_queue.put(content_to_process)
+            
+            # Short sleep to prevent CPU spinning
+            sleep(0.1)
 
-                message = self.tts_socket.recv()
-                if message is None:
-                    continue
+def translation_worker():
+    """
+    Worker thread function that processes buffered transcript texts:
+    translates them and queues for speech synthesis.
+    """
+    while True:
+        try:
+            # Wait for a transcript text
+            transcript = translation_queue.get(timeout=1)
+        except Empty:
+            continue
 
-                if isinstance(message, str):
-                    print(f"TTS message: {message}")
-                elif isinstance(message, bytes):
-                    print(f"Received TTS audio data of length: {len(message)} bytes")  # Debug log
-                    self.speaker.play(message)
-        except Exception as e:
-            print(f"TTS receiver error: {e}")
-    
-    def tts_sender(self):
-        """Send transcribed text to TTS service"""
         try:
-            while not self.exit.is_set():
-                try:
-                    text = self.transcription_queue.get(timeout=1.0)
-                    if text:
-                        print(f"Sending to TTS: {text}")
-                        self.tts_socket.send(json.dumps({"type": "Speak", "text": text}))
-                except queue.Empty:
-                    # Timeout, continue loop
-                    continue
-                except Exception as e:
-                    print(f"TTS sender error: {e}")
-        except Exception as e:
-            print(f"TTS sender thread error: {e}")
-        finally:
-            print("TTS sender thread exiting")
-    
-    def transcription_streamer(self):
-        """Stream audio from YouTube to Deepgram for transcription"""
-        try:
-            options = LiveOptions(
-                smart_format=True, 
-                model="nova-2", 
-                language=self.target_language,
-                punctuate=True,
-                interim_results=False
+            # --- Translation using OpenAI GPT-3.5-turbo ---
+            translation_response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "developer", "content": "You are a language translator. Translate the following text to English:"},
+                    {"role": "user", "content": transcript}
+                ]
             )
-            self.dg_connection.start(options)
+            translated_text = translation_response.choices[0].message.content.strip()
+            print(f"Translated text: {translated_text}")
             
-            with httpx.stream('GET', self.audio_url) as r:
-                for data in r.iter_bytes():
-                    self.lock_exit.acquire()
-                    if self.exit.is_set():
-                        self.lock_exit.release()
-                        break
-                    self.lock_exit.release()
-
-                    self.dg_connection.send(data)
-                    
-        except Exception as e:
-            print(f"Transcription streamer error: {e}")
-        finally:
-            print("Transcription streamer exiting")
-    
-    def start(self):
-        """Start the full pipeline"""
-        self.setup()
-        
-        # Start TTS receiver thread
-        self.tts_receiver_thread = threading.Thread(
-            target=asyncio.run, 
-            args=(self.tts_receiver(),)
-        )
-        self.tts_receiver_thread.start()
-        
-        # Start TTS sender thread
-        self.tts_sender_thread = threading.Thread(
-            target=self.tts_sender
-        )
-        self.tts_sender_thread.start()
-        
-        # Start transcription streamer thread
-        self.transcription_thread = threading.Thread(
-            target=self.transcription_streamer
-        )
-        self.transcription_thread.start()
-        
-        # Wait for user to stop
-        print("\nListening and speaking... Press Enter to stop\n")
-        input()
-        
-        # Clean up
-        self.stop()
-    
-    def stop(self):
-        """Stop all threads and clean up resources"""
-        print("Shutting down...")
-        self.exit.set()
-        
-        # Close transcription connection
-        if self.dg_connection:
-            self.dg_connection.finish()
+            # --- Text-to-Speech using OpenAI TTS endpoint ---
+            speech_file_path = Path(f"speech_{int(time.time()*1000)}.mp3")
+            tts_response = openai_client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=translated_text,
+            )
+            tts_response.stream_to_file(speech_file_path)
             
-        # Close TTS connection
-        if self.tts_socket:
+            # Load audio and add to playback queue
+            audio = AudioSegment.from_file(speech_file_path, format="mp3")
+            audio_queue.put(audio)
+            
+            # Clean up temp file
             try:
-                self.tts_socket.send(json.dumps({"type": "Flush"}))
-                self.tts_socket.send(json.dumps({"type": "Close"}))
-                self.tts_socket.close()
+                os.remove(speech_file_path)
             except:
                 pass
                 
-        # Stop audio playback
-        if self.speaker:
-            self.speaker.stop()
-            
-        # Wait for transcription thread to complete
-        if hasattr(self, 'transcription_thread'):
-            self.transcription_thread.join()
-            
-        # TTS sender thread can be joined directly
-        if hasattr(self, 'tts_sender_thread'):
-            self.tts_sender_thread.join()
+        except Exception as e:
+            print(f"Processing error: {e}")
 
-        # The TTS receiver thread is using asyncio.run so it might not be directly joinable
-        # Force exit instead
-        print("Pipeline stopped")
+        # Mark this item as processed
+        translation_queue.task_done()
+
+def audio_playback_worker():
+    """
+    Worker thread that handles continuous audio playback from the queue.
+    """
+    while True:
+        try:
+            # Get audio segment to play
+            audio = audio_queue.get(timeout=1)
+            # Play the audio
+            play(audio)
+            audio_queue.task_done()
+        except Empty:
+            # No audio to play, continue checking
+            sleep(0.1)
+        except Exception as e:
+            print(f"Playback error: {e}")
+            audio_queue.task_done()
+
+# Start the worker threads
+buffer_thread = threading.Thread(target=buffer_processor, daemon=True)
+buffer_thread.start()
+
+translation_thread = threading.Thread(target=translation_worker, daemon=True)
+translation_thread.start()
+
+playback_thread = threading.Thread(target=audio_playback_worker, daemon=True)
+playback_thread.start()
+
+def on_message(self, result, **kwargs):
+    # Extract the transcript text from Deepgram's result
+    transcript = result.channel.alternatives[0].transcript
+    if not transcript.strip():
+        return
+    
+    print(f"Received transcript: {transcript}")
+    # Put the transcript text on the buffer queue with current timestamp
+    transcript_buffer.put((transcript, time.time()))
 
 def main():
-    # Show usage if help is requested
-    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
-        print("Usage: python deepgram_test.py [YOUTUBE_URL] [TARGET_LANGUAGE]")
-        print("\nOptions:")
-        print("  YOUTUBE_URL     : URL of the YouTube video to transcribe")
-        print("  TARGET_LANGUAGE : Language code (en, es, fr, de, etc.)")
-        print("\nSupported languages:")
-        for lang, voice in VOICE_MAP.items():
-            print(f"  {lang} - {voice}")
-        sys.exit(0)
-        
-    # YouTube video to transcribe and speak
-    default_youtube_link = "https://www.youtube.com/watch?v=Osl4NgAXvRk"
-    default_language = "en"
-    
-    # Process command line arguments
-    youtube_link = sys.argv[1] if len(sys.argv) > 1 else default_youtube_link
-    target_language = sys.argv[2] if len(sys.argv) > 2 else default_language
-    
-    print(f"Using YouTube video: {youtube_link}")
-    print(f"Target language: {target_language}")
-    
-    # Create and start the pipeline
-    pipeline = TranscribeSpeakPipeline(youtube_link, target_language=target_language)
-    pipeline.start()
+    try:
+        # Initialize Deepgram client (legacy interface)
+        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
+        dg_connection = deepgram.listen.live.v('1')
+
+        # Register the on_message callback
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+
+        # Create connection options (example: using German as source language)
+        options = LiveOptions(smart_format=True, model="nova-2", language="de-DE")
+        dg_connection.start(options)
+
+        # Use a lock and flag to manage graceful exit of the streaming thread
+        lock_exit = threading.Lock()
+        exit_flag = False
+
+        def stream_thread():
+            # Stream audio data from the YouTube audio URL to Deepgram
+            with httpx.stream('GET', URL) as r:
+                for data in r.iter_bytes():
+                    lock_exit.acquire()
+                    if exit_flag:
+                        lock_exit.release()
+                        break
+                    lock_exit.release()
+                    dg_connection.send(data)
+                    sleep(0.01)  # Slight delay to avoid overwhelming the connection
+
+        streamer = threading.Thread(target=stream_thread)
+        streamer.start()
+
+        input('Press Enter to stop transcription...\n')
+        lock_exit.acquire()
+        exit_flag = True
+        lock_exit.release()
+        streamer.join()
+
+        dg_connection.finish()
+        print('Finished streaming and transcription.')
+
+        # Wait for all queues to be fully processed before exiting
+        transcript_buffer.join()
+        translation_queue.join()
+        audio_queue.join()
+
+    except Exception as e:
+        print(f"Could not open socket: {e}")
+        return
 
 if __name__ == '__main__':
     main()

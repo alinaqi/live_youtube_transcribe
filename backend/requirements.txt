@@ -10,4 +10,6 @@ python-multipart==0.0.6
 websockets==11.0.3
 aiofiles==23.2.1
 openai==1.6.1  # For translation capabilities
-ffmpeg-python==0.2.0  # For audio processing 
+ffmpeg-python==0.2.0  # For audio processing
+pydub==0.25.1  # For audio processing and playback
+yt-dlp==2023.11.14  # For YouTube audio extraction 
